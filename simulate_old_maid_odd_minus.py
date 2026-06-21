@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""Simulate the balanced-odd-player Old Maid rule with the odd player down one card."""
+
+from __future__ import annotations
+
+import argparse
+import random
+import sys
+from pathlib import Path
+
+from simulate_old_maid import (
+    CASE_HEADERS,
+    DEFAULT_K,
+    DEFAULT_MAX_PAIRS,
+    DEFAULT_PLAYERS,
+    DEFAULT_SEED,
+    DEFAULT_TRIALS,
+    JOKER,
+    PLAYER_HEADERS,
+    CaseStats,
+    GameResult,
+    ProgressBar,
+    alive_players,
+    binomial_se,
+    build_deck,
+    count_odd_alive_players,
+    first_out_credit,
+    fmt_float,
+    next_player_with_cards,
+    parse_k,
+    parse_k_text,
+    parse_nonempty_text,
+    parse_players,
+    parse_players_text,
+    parse_positive_int,
+    prompt_until_valid,
+    ranks_from_out_groups,
+    remove_pairs,
+    write_csv,
+)
+
+
+RULE_ID = "balanced_odd_T_2kN_minus_1"
+DEFAULT_OUT_PREFIX = "results/balanced_odd_minus"
+
+
+def validate_case(n_players: int, trials: int, max_pairs: int, k: int) -> None:
+    pair_count = k * n_players - 1
+    if n_players < 2:
+        raise ValueError("N must be at least 2")
+    if trials <= 0:
+        raise ValueError("--trials must be positive")
+    if max_pairs <= 0:
+        raise ValueError("--max-pairs must be positive")
+    if k < 1:
+        raise ValueError("k must be at least 1")
+    if pair_count < 1:
+        raise ValueError("P = kN - 1 must be at least 1")
+    if pair_count > max_pairs:
+        raise ValueError(
+            f"P = kN - 1 = {pair_count} exceeds max pairs {max_pairs} "
+            f"for N = {n_players}"
+        )
+
+
+def play_one_game(n_players: int, k: int, rng: random.Random) -> GameResult:
+    pair_count = k * n_players - 1
+    deck = build_deck(pair_count)
+    rng.shuffle(deck)
+
+    hand_sizes = [2 * k - 1] + [2 * k] * (n_players - 1)
+    hands: list[list[int]] = []
+    offset = 0
+    for hand_size in hand_sizes:
+        hand = deck[offset : offset + hand_size]
+        hands.append(remove_pairs(hand))
+        offset += hand_size
+
+    initial_clear = [not hand for hand in hands]
+    active_exit = [False] * n_players
+    out_groups: list[list[int]] = []
+    initial_clear_group = [seat for seat, cleared in enumerate(initial_clear) if cleared]
+    if initial_clear_group:
+        out_groups.append(initial_clear_group)
+
+    turns = 0
+    passive_eliminations = 0
+    invariant_violations = 0
+    active = 0
+
+    if count_odd_alive_players(hands) != 1:
+        invariant_violations += 1
+
+    while len(alive_players(hands)) > 1:
+        if not hands[active]:
+            odd_players = [
+                seat for seat, hand in enumerate(hands) if hand and len(hand) % 2 == 1
+            ]
+            if not odd_players:
+                invariant_violations += 1
+                break
+            active = odd_players[0]
+
+        if count_odd_alive_players(hands) != 1:
+            invariant_violations += 1
+
+        target = next_player_with_cards(hands, active)
+        if target is None:
+            break
+
+        turns += 1
+        drawn_index = rng.randrange(len(hands[target]))
+        drawn_card = hands[target].pop(drawn_index)
+        if not hands[target]:
+            passive_eliminations += 1
+
+        if drawn_card != JOKER and drawn_card in hands[active]:
+            hands[active].remove(drawn_card)
+        else:
+            hands[active].append(drawn_card)
+
+        if not hands[active] and active not in initial_clear_group:
+            active_exit[active] = True
+            out_groups.append([active])
+
+        if count_odd_alive_players(hands) != 1 and len(alive_players(hands)) > 1:
+            invariant_violations += 1
+
+        active = target
+
+    remaining = alive_players(hands)
+    loser = remaining[0] if remaining else 0
+    final_joker_error = not (remaining and hands[loser] == [JOKER])
+    ranks = ranks_from_out_groups(n_players, out_groups, loser)
+    credit = first_out_credit(n_players, out_groups)
+
+    return GameResult(
+        loser=loser,
+        turns=turns,
+        ranks=ranks,
+        first_out_credit=credit,
+        initial_clear=initial_clear,
+        active_exit=active_exit,
+        passive_eliminations=passive_eliminations,
+        invariant_violations=invariant_violations,
+        final_joker_error=final_joker_error,
+    )
+
+
+def simulate_case(
+    n_players: int,
+    k: int,
+    trials: int,
+    rng: random.Random,
+    progress_label: str | None = None,
+) -> CaseStats:
+    pair_count = k * n_players - 1
+    total_cards = 2 * pair_count + 1
+    initial_hand_sizes = [2 * k - 1] + [2 * k] * (n_players - 1)
+
+    loss_counts = [0] * n_players
+    first_out_credits = [0.0] * n_players
+    initial_clear_counts = [0] * n_players
+    active_exit_counts = [0] * n_players
+    rank_sums = [0.0] * n_players
+    total_turns = 0
+    total_initial_clears = 0
+    passive_elimination_count = 0
+    invariant_violation_count = 0
+    final_joker_error_count = 0
+    progress = ProgressBar(trials, progress_label) if progress_label else None
+    if progress:
+        progress.update(0)
+
+    for trial_index in range(1, trials + 1):
+        result = play_one_game(n_players, k, rng)
+        loss_counts[result.loser] += 1
+        total_turns += result.turns
+        passive_elimination_count += result.passive_eliminations
+        invariant_violation_count += result.invariant_violations
+        final_joker_error_count += int(result.final_joker_error)
+
+        for seat in range(n_players):
+            first_out_credits[seat] += result.first_out_credit[seat]
+            initial_clear_counts[seat] += int(result.initial_clear[seat])
+            active_exit_counts[seat] += int(result.active_exit[seat])
+            rank_sums[seat] += result.ranks[seat]
+            total_initial_clears += int(result.initial_clear[seat])
+        if progress:
+            progress.update(trial_index)
+
+    player_rows: list[dict[str, object]] = []
+    loss_rates: list[float] = []
+    first_out_rates: list[float] = []
+    avg_ranks: list[float] = []
+
+    for seat in range(n_players):
+        loss_rate = loss_counts[seat] / trials
+        se = binomial_se(loss_rate, trials)
+        ci_low = max(0.0, loss_rate - 1.96 * se)
+        ci_high = min(1.0, loss_rate + 1.96 * se)
+        first_out_rate = first_out_credits[seat] / trials
+        avg_rank = rank_sums[seat] / trials
+
+        loss_rates.append(loss_rate)
+        first_out_rates.append(first_out_rate)
+        avg_ranks.append(avg_rank)
+
+        player_rows.append(
+            {
+                "rule_id(規則代號)": RULE_ID,
+                "N(玩家人數)": n_players,
+                "k(每位玩家基準對數)": k,
+                "pairs(使用對數)": pair_count,
+                "total_cards(總牌數)": total_cards,
+                "trials(模擬局數)": trials,
+                "seat(玩家座位)": seat,
+                "is_initial_odd_player(是否為開局奇數玩家)": "是" if seat == 0 else "否",
+                "initial_hand_size(開局手牌數)": initial_hand_sizes[seat],
+                "initial_joker_probability(開局持有落單牌機率)": fmt_float(
+                    initial_hand_sizes[seat] / total_cards
+                ),
+                "loss_count(輸的次數)": loss_counts[seat],
+                "loss_rate(輸的比例)": fmt_float(loss_rate),
+                "loss_rate_se(輸率標準誤)": fmt_float(se),
+                "loss_rate_ci95_low(輸率95信賴區間下限)": fmt_float(ci_low),
+                "loss_rate_ci95_high(輸率95信賴區間上限)": fmt_float(ci_high),
+                "first_out_credit_rate(首位出局比例)": fmt_float(first_out_rate),
+                "initial_clear_rate(開局整理後出局比例)": fmt_float(
+                    initial_clear_counts[seat] / trials
+                ),
+                "active_exit_rate(自己行動後出局比例)": fmt_float(
+                    active_exit_counts[seat] / trials
+                ),
+                "avg_rank(平均名次)": fmt_float(avg_rank),
+            }
+        )
+
+    odd_loss_rate = loss_rates[0]
+    others_loss_rate_mean = sum(loss_rates[1:]) / (n_players - 1)
+    odd_first_out_rate = first_out_rates[0]
+    others_first_out_rate_mean = sum(first_out_rates[1:]) / (n_players - 1)
+    odd_avg_rank = avg_ranks[0]
+    others_avg_rank_mean = sum(avg_ranks[1:]) / (n_players - 1)
+
+    case_row = {
+        "N(玩家人數)": n_players,
+        "k(每位玩家基準對數)": k,
+        "pairs(使用對數)": pair_count,
+        "total_cards(總牌數)": total_cards,
+        "trials(模擬局數)": trials,
+        "odd_loss_rate(奇數玩家輸率)": fmt_float(odd_loss_rate),
+        "others_loss_rate_mean(其他玩家平均輸率)": fmt_float(others_loss_rate_mean),
+        "loss_rate_diff_odd_minus_others(奇數玩家輸率減其他玩家平均輸率)": fmt_float(
+            odd_loss_rate - others_loss_rate_mean
+        ),
+        "odd_first_out_rate(奇數玩家首位出局比例)": fmt_float(odd_first_out_rate),
+        "others_first_out_rate_mean(其他玩家平均首位出局比例)": fmt_float(
+            others_first_out_rate_mean
+        ),
+        "odd_avg_rank(奇數玩家平均名次)": fmt_float(odd_avg_rank),
+        "others_avg_rank_mean(其他玩家平均名次)": fmt_float(others_avg_rank_mean),
+        "avg_turns(平均回合數)": fmt_float(total_turns / trials),
+        "avg_initial_clears(平均開局整理後出局人數)": fmt_float(
+            total_initial_clears / trials
+        ),
+        "passive_elimination_count(被動出局次數)": passive_elimination_count,
+        "invariant_violation_count(奇偶不變量違反次數)": invariant_violation_count,
+        "final_joker_error_count(結局落單牌檢查錯誤次數)": final_joker_error_count,
+    }
+
+    return CaseStats(player_rows=player_rows, case_row=case_row)
+
+
+def write_summary(
+    path: Path,
+    players: list[int],
+    trials: int,
+    max_pairs: int,
+    seed: int,
+    k_text: str,
+    case_rows: list[dict[str, object]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "# 抽鬼牌模擬摘要",
+        "",
+        "## 模擬參數",
+        "",
+        f"- 規則代號：`{RULE_ID}`",
+        "- 牌數公式：`P = kN - 1`，`T = 2kN - 1`",
+        "- 發牌型態：奇數玩家 `2k - 1` 張，其他玩家 `2k` 張",
+        f"- 玩家數：`{','.join(str(player) for player in players)}`",
+        f"- 每組模擬局數：`{trials}`",
+        f"- 最大可用對數：`{max_pairs}`",
+        f"- k 設定：`{k_text}`",
+        f"- 隨機種子：`{seed}`",
+        "",
+        "## 各玩家數設定",
+        "",
+        "| 玩家數 N | k | 使用對數 P | 總牌數 T | 發牌型態 |",
+        "|---:|---:|---:|---:|---|",
+    ]
+
+    for row in case_rows:
+        n_players = int(row["N(玩家人數)"])
+        k = int(row["k(每位玩家基準對數)"])
+        hand_pattern = f"{2 * k - 1}, " + ", ".join(["%d" % (2 * k)] * (n_players - 1))
+        lines.append(
+            "| {n} | {k} | {pairs} | {total} | {pattern} |".format(
+                n=n_players,
+                k=k,
+                pairs=row["pairs(使用對數)"],
+                total=row["total_cards(總牌數)"],
+                pattern=hand_pattern,
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 奇數玩家與其他玩家比較",
+            "",
+            "| 玩家數 N | 奇數玩家輸率 | 其他玩家平均輸率 | 差值 | 奇數玩家首位出局比例 | 其他玩家平均首位出局比例 | 奇數玩家平均名次 | 其他玩家平均名次 |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+
+    for row in case_rows:
+        lines.append(
+            "| {n} | {odd_loss} | {other_loss} | {diff} | {odd_first} | {other_first} | {odd_rank} | {other_rank} |".format(
+                n=row["N(玩家人數)"],
+                odd_loss=row["odd_loss_rate(奇數玩家輸率)"],
+                other_loss=row["others_loss_rate_mean(其他玩家平均輸率)"],
+                diff=row[
+                    "loss_rate_diff_odd_minus_others(奇數玩家輸率減其他玩家平均輸率)"
+                ],
+                odd_first=row["odd_first_out_rate(奇數玩家首位出局比例)"],
+                other_first=row["others_first_out_rate_mean(其他玩家平均首位出局比例)"],
+                odd_rank=row["odd_avg_rank(奇數玩家平均名次)"],
+                other_rank=row["others_avg_rank_mean(其他玩家平均名次)"],
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 流程檢查",
+            "",
+            "| 玩家數 N | 平均回合數 | 平均開局整理後出局人數 | 被動出局次數 | 奇偶不變量違反次數 | 結局落單牌檢查錯誤次數 |",
+            "|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+
+    for row in case_rows:
+        lines.append(
+            "| {n} | {turns} | {initial} | {passive} | {invariant} | {joker} |".format(
+                n=row["N(玩家人數)"],
+                turns=row["avg_turns(平均回合數)"],
+                initial=row["avg_initial_clears(平均開局整理後出局人數)"],
+                passive=row["passive_elimination_count(被動出局次數)"],
+                invariant=row["invariant_violation_count(奇偶不變量違反次數)"],
+                joker=row["final_joker_error_count(結局落單牌檢查錯誤次數)"],
+            )
+        )
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def collect_interactive_args() -> argparse.Namespace:
+    print("抽鬼牌模擬程式互動模式（奇數玩家少一張）")
+    print("直接按 Enter 會使用預設值。")
+    print()
+
+    players_text = prompt_until_valid(
+        "玩家人數",
+        DEFAULT_PLAYERS,
+        '可輸入範圍或清單，例如 "2-13"、"3,5,7"、"2-6,10"',
+        parse_players_text,
+    )
+    trials = prompt_until_valid(
+        "每個玩家數要模擬幾局",
+        DEFAULT_TRIALS,
+        "建議正式研究至少 100000；測試可先用 1000",
+        lambda value: parse_positive_int(value, "模擬局數"),
+    )
+    max_pairs = prompt_until_valid(
+        "最大可用對數",
+        DEFAULT_MAX_PAIRS,
+        "標準 52 張牌為 26 對",
+        lambda value: parse_positive_int(value, "最大可用對數"),
+    )
+    k_text = prompt_until_valid(
+        "k 設定",
+        DEFAULT_K,
+        '輸入 auto 代表使用與原本程式相同的 floor(最大可用對數 / N)，或輸入正整數',
+        parse_k_text,
+    )
+    seed = prompt_until_valid(
+        "隨機種子",
+        DEFAULT_SEED,
+        "同一個種子會產生可重現結果",
+        int,
+    )
+    out_prefix = prompt_until_valid(
+        "輸出檔案前綴",
+        DEFAULT_OUT_PREFIX,
+        "會產生 *_player_stats.csv、*_case_stats.csv、*_summary.md",
+        lambda value: parse_nonempty_text(value, "輸出檔案前綴"),
+    )
+
+    return argparse.Namespace(
+        players=players_text,
+        trials=trials,
+        max_pairs=max_pairs,
+        k=k_text,
+        seed=seed,
+        out_prefix=out_prefix,
+    )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Simulate balanced-odd-player Old Maid games with T = 2kN - 1."
+    )
+    parser.add_argument("--players", default=DEFAULT_PLAYERS, help='player counts, e.g. "2-13"')
+    parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS, help="trials per N")
+    parser.add_argument(
+        "--max-pairs",
+        type=int,
+        default=DEFAULT_MAX_PAIRS,
+        help="maximum available pair count, 26 for a standard deck",
+    )
+    parser.add_argument(
+        "--k",
+        default=DEFAULT_K,
+        help='auto or a positive integer; auto uses floor(max_pairs / N)',
+    )
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="random seed")
+    parser.add_argument(
+        "--out-prefix",
+        default=DEFAULT_OUT_PREFIX,
+        help="output file prefix",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
+    interactive = len(sys.argv) == 1
+
+    while True:
+        if interactive:
+            args = collect_interactive_args()
+        else:
+            args = parser.parse_args()
+
+        try:
+            players = parse_players(args.players)
+            fixed_k = parse_k(args.k)
+
+            for n_players in players:
+                k = args.max_pairs // n_players if fixed_k is None else fixed_k
+                validate_case(n_players, args.trials, args.max_pairs, k)
+            break
+        except ValueError as exc:
+            if not interactive:
+                parser.error(str(exc))
+            print()
+            print(f"參數組合錯誤：{exc}")
+            print("請重新輸入一次。")
+            print()
+
+    rng = random.Random(args.seed)
+    player_rows: list[dict[str, object]] = []
+    case_rows: list[dict[str, object]] = []
+
+    for n_players in players:
+        k = args.max_pairs // n_players if fixed_k is None else fixed_k
+        total_cards = 2 * k * n_players - 1
+        progress_label = f"N={n_players} k={k} T={total_cards}"
+        stats = simulate_case(n_players, k, args.trials, rng, progress_label)
+        player_rows.extend(stats.player_rows)
+        case_rows.append(stats.case_row)
+        print(
+            "N={n} k={k} T={total} trials={trials} done".format(
+                n=n_players,
+                k=k,
+                total=stats.case_row["total_cards(總牌數)"],
+                trials=args.trials,
+            )
+        )
+
+    out_prefix = Path(args.out_prefix)
+    player_path = out_prefix.with_name(out_prefix.name + "_player_stats.csv")
+    case_path = out_prefix.with_name(out_prefix.name + "_case_stats.csv")
+    summary_path = out_prefix.with_name(out_prefix.name + "_summary.md")
+
+    write_csv(player_path, PLAYER_HEADERS, player_rows)
+    write_csv(case_path, CASE_HEADERS, case_rows)
+    write_summary(
+        summary_path,
+        players,
+        args.trials,
+        args.max_pairs,
+        args.seed,
+        args.k,
+        case_rows,
+    )
+
+    print(f"wrote {player_path}")
+    print(f"wrote {case_path}")
+    print(f"wrote {summary_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
